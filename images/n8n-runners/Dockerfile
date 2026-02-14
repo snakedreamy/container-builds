@@ -17,9 +17,8 @@ RUN cd /opt/runners/task-runner-python && \
     uv pip install numpy pandas requests
 
 # --- 安全配置 ---
-# 复制配置文件到系统目录
+# ✅ 只覆盖 /etc/n8n-task-runners.json（按官方方式）
 COPY n8n-task-runners.json /etc/n8n-task-runners.json
-# 兼容性复制 (防止旧版本 n8n 查找路径不同)
-COPY n8n-task-runners.json /etc/task-runners.json
+RUN chmod 0644 /etc/n8n-task-runners.json
 
 USER runner
