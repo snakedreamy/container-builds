@@ -1,0 +1,95 @@
+name: build-n8n
+
+on:
+  # 你改了 n8n 镜像相关文件就构建（md 不触发）
+  push:
+    branches: [ "main" ]
+    paths:
+      - "images/n8n/**"
+      - ".github/workflows/build-n8n.yml"
+    paths-ignore:
+      - "**/*.md"
+
+  # 允许手动触发
+  workflow_dispatch:
+
+  # 定时检查上游是否发布新版本（你想更激进可改成每小时）
+  schedule:
+    - cron: "0 */6 * * *"  # 每 6 小时一次（UTC）
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) 获取 n8n 上游最新 release 版本号
+      # 使用 GitHub API：稳定、无需额外 token（默认 GITHUB_TOKEN 足够）
+      - name: 获取上游 n8n 最新版本号
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 通过 GitHub API 获取最新 release tag_name
+          # 返回一般是类似 "2.10.0"
+          N8N_VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/n8n-io/n8n/releases/latest \
+            | jq -r '.tag_name'
+          )"
+
+          # 有的仓库 tag 可能带 v 前缀，这里统一去掉 v
+          N8N_VERSION="${N8N_VERSION#v}"
+
+          echo "n8n_version=${N8N_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "上游最新 n8n 版本：${N8N_VERSION}"
+
+      # 2) 登录 GHCR
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3) 如果这个版本的 tag 在 GHCR 已经存在，就跳过构建
+      # 这样 schedule 每 6 小时跑也不会重复消耗资源
+      - name: 如果 GHCR 已有该版本则跳过
+        id: check
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository_owner }}/n8n:${{ steps.upstream.outputs.n8n_version }}"
+
+          # docker manifest inspect 返回 0 表示存在，非 0 表示不存在
+          if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "GHCR 已存在：${IMAGE}，跳过构建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "GHCR 不存在：${IMAGE}，将执行构建"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.check.outputs.exists != 'true'
+
+      # 4) 构建并推送（只在不存在时执行）
+      - name: 构建并推送 n8n 镜像
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/n8n/Dockerfile
+          push: true
+          build-args: |
+            N8N_VERSION=${{ steps.upstream.outputs.n8n_version }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/n8n:latest
+            ghcr.io/${{ github.repository_owner }}/n8n:${{ steps.upstream.outputs.n8n_version }}
+            ghcr.io/${{ github.repository_owner }}/n8n:sha-${{ github.sha }}
