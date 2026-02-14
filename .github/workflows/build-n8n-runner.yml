@@ -1,4 +1,4 @@
-name: build-n8n-runner
+name: 构建并发布 n8n-runner 镜像
 
 on:
   push:
@@ -9,9 +9,8 @@ on:
 
   workflow_dispatch:
 
-  # 定时检查上游 latest 是否变化（你可改成每小时）
   schedule:
-    - cron: "15 */6 * * *"
+    - cron: "15 */6 * * *"  # 每 6 小时一次（UTC）
 
 permissions:
   contents: read
@@ -23,92 +22,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 1) 从 Docker Hub 获取 n8nio/runners:latest 的信息（以它为“稳定最新版”基准）
-      #    重点：不要用“版本号最大”当最新，因为可能取到测试/预发布
-      # ------------------------------------------------------------
-      - name: 获取上游 runners:latest 的 digest，并尝试解析出稳定版本号
+      # 1) 获取 n8nio/runners:latest 的 digest（用于判断上游是否更新）
+      - name: 获取上游 runners:latest 的 digest（作为更新判断依据）
         id: upstream
         run: |
           set -euo pipefail
 
           # Docker Hub tag 详情 API（latest）
-          # 返回的 JSON 里包含 images 数组（不同架构），以及 last_updated
           LATEST_JSON="$(curl -fsSL "https://hub.docker.com/v2/repositories/n8nio/runners/tags/latest")"
 
-          # 取 latest 的“某个架构”的 digest 用于追踪版本变化
-          # 这里优先 linux/amd64，如果没有就取第一个
+          # 优先取 linux/amd64 的 digest 作为“更新 key”
           LATEST_DIGEST="$(
             echo "${LATEST_JSON}" \
-            | jq -r '
-              ( .images[] | select(.os=="linux" and .architecture=="amd64") | .digest ) // empty
-            ' | head -n 1
+            | jq -r '( .images[] | select(.os=="linux" and .architecture=="amd64") | .digest ) // empty' \
+            | head -n 1
           )"
+
+          # 如果没取到，就取第一个
           if [ -z "${LATEST_DIGEST}" ] || [ "${LATEST_DIGEST}" = "null" ]; then
             LATEST_DIGEST="$(echo "${LATEST_JSON}" | jq -r '.images[0].digest')"
           fi
 
           if [ -z "${LATEST_DIGEST}" ] || [ "${LATEST_DIGEST}" = "null" ]; then
-            echo "无法获取 runners:latest 的 digest（Docker Hub API 结构可能变化）" >&2
+            echo "无法获取 runners:latest digest（Docker Hub API 可能变更）" >&2
             exit 1
           fi
 
-          # 取一个短 digest 做 tag（可追溯）
           SHORT_DIGEST="$(echo "${LATEST_DIGEST}" | sed 's/^sha256://g' | cut -c1-12)"
 
-          # ------------------------------------------------------------
-          # 2) 尝试把 latest 对应到“纯语义版本号 tag”（比如 1.121.0）
-          #    方法：列出 tags（分页取足够多），找到 digest 相同的 tag
-          #    并且过滤掉带 -rc / -beta / -alpha 之类的预发布
-          # ------------------------------------------------------------
-          # 取前 200 个 tag 通常足够；如果你担心不够，可做分页循环（后续我也能帮你加）
-          TAGS_JSON="$(curl -fsSL "https://hub.docker.com/v2/repositories/n8nio/runners/tags?page_size=200")"
-
-          # 找出与 latest digest 匹配、且名称是纯 x.y.z 的 tag
-          STABLE_VERSION="$(
-            echo "${TAGS_JSON}" \
-            | jq -r --arg dg "${LATEST_DIGEST}" '
-                .results[]
-                | select(.images != null)
-                | select( any(.images[]; .digest == $dg) )
-                | .name
-              ' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-            | head -n 1 || true
-          )"
-
-          # 输出给后续 steps 使用
           echo "latest_digest=${LATEST_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "short_digest=${SHORT_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "stable_version=${STABLE_VERSION}" >> "$GITHUB_OUTPUT"
 
           echo "上游 runners:latest digest = ${LATEST_DIGEST}"
           echo "上游 runners:latest short  = ${SHORT_DIGEST}"
-          if [ -n "${STABLE_VERSION}" ]; then
-            echo "解析到 latest 对应稳定版本号 = ${STABLE_VERSION}"
-          else
-            echo "未能从前 200 个 tag 中解析到 stable_version（不影响构建，会继续使用 latest）"
-          fi
 
-      # ------------------------------------------------------------
-      # 3) 登录 GHCR
-      # ------------------------------------------------------------
+      # 2) 登录 GHCR
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ------------------------------------------------------------
-      # 4) 如果 GHCR 已经存在 digest 对应的构建产物，就跳过
-      #    我们用 digest-<short> 作为“唯一标识”
-      # ------------------------------------------------------------
+      # 3) 如果 GHCR 已经存在这个 digest 标识的 tag，就跳过
       - name: 如果 GHCR 已有该 digest 版本则跳过
         id: check
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/n8n-runner:digest-${{ steps.upstream.outputs.short_digest }}"
-
           if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "GHCR 已存在：${IMAGE}，跳过构建"
@@ -117,38 +77,27 @@ jobs:
             echo "GHCR 不存在：${IMAGE}，将执行构建"
           fi
 
+      # 4) 多架构构建：启用 QEMU
+      - name: 启用 QEMU（跨架构构建）
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
         if: steps.check.outputs.exists != 'true'
 
-      # ------------------------------------------------------------
-      # 5) 构建并推送
-      #    重点：FROM 使用 n8nio/runners:latest，保证你要的“稳定最新版”策略
-      # ------------------------------------------------------------
-      - name: 构建并推送 n8n-runner 镜像
+      # 5) 构建并推送（以 latest 为基准；多架构）
+      - name: 构建并推送 n8n-runner 镜像（多架构）
         if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
+          # 关键修复：context 指向 images/n8n-runner，COPY 才能找到 n8n-task-runners.json
           context: images/n8n-runner
           file: images/n8n-runner/Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             RUNNERS_VERSION=latest
           tags: |
             ghcr.io/${{ github.repository_owner }}/n8n-runner:latest
             ghcr.io/${{ github.repository_owner }}/n8n-runner:digest-${{ steps.upstream.outputs.short_digest }}
             ghcr.io/${{ github.repository_owner }}/n8n-runner:sha-${{ github.sha }}
-
-      # ------------------------------------------------------------
-      # 6) （可选）如果解析到了 stable_version（如 1.121.0），额外打一个版本 tag
-      #    这一步不重新构建：直接给同一个镜像补 tag 最方便
-      #    注意：GitHub Actions 没有直接“重打 tag”的内建 action，
-      #          我们用 docker buildx imagetools create 来做远程 tag 复用
-      # ------------------------------------------------------------
-      - name: 如果解析到稳定版本号，则额外发布版本 tag
-        if: steps.check.outputs.exists != 'true' && steps.upstream.outputs.stable_version != ''
-        run: |
-          set -euo pipefail
-          SRC="ghcr.io/${{ github.repository_owner }}/n8n-runner:digest-${{ steps.upstream.outputs.short_digest }}"
-          DST="ghcr.io/${{ github.repository_owner }}/n8n-runner:${{ steps.upstream.outputs.stable_version }}"
-          echo "为镜像增加版本 tag：${DST} -> ${SRC}"
-          docker buildx imagetools create -t "${DST}" "${SRC}"

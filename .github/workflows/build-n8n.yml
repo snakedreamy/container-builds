@@ -1,17 +1,17 @@
-name: build-n8n
+name: 构建并发布 n8n 镜像
 
 on:
-  # 你改了 n8n 镜像相关文件就构建（md 不触发）
+  # 你改了 n8n 镜像相关文件才触发（README.md 不会触发，因为不在 paths 里）
   push:
     branches: [ "main" ]
     paths:
       - "images/n8n/**"
       - ".github/workflows/build-n8n.yml"
 
-  # 允许手动触发
+  # 手动触发
   workflow_dispatch:
 
-  # 定时检查上游是否发布新版本（你想更激进可改成每小时）
+  # 定时检查上游 n8n 是否发布新版本
   schedule:
     - cron: "0 */6 * * *"  # 每 6 小时一次（UTC）
 
@@ -25,8 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) 获取 n8n 上游最新 release 版本号
-      # 使用 GitHub API：稳定、无需额外 token（默认 GITHUB_TOKEN 足够）
+      # 1) 获取上游 n8n 最新稳定 release 版本号
       - name: 获取上游 n8n 最新版本号
         id: upstream
         env:
@@ -42,23 +41,22 @@ jobs:
             | jq -r '.tag_name'
           )"
 
-          echo "上游返回的原始 tag_name：${RAW_TAG}"
+          echo "上游返回原始 tag_name：${RAW_TAG}"
 
-          # 处理常见格式：
-          # 1) v2.7.5 -> 2.7.5
-          # 2) n8n@2.7.5 -> 2.7.5
-          # 3) 其他类似 xxx@2.7.5 -> 2.7.5（取 @ 后半段）
+          # 清洗 tag：
+          # - v2.7.5 -> 2.7.5
+          # - n8n@2.7.5 -> 2.7.5
           N8N_VERSION="${RAW_TAG#v}"
-          N8N_VERSION="${N8N_VERSION##*@}"   # 如果包含 @，取最后一个 @ 之后的内容
+          N8N_VERSION="${N8N_VERSION##*@}"
 
-          # 最后做一次基本校验：必须是 x.y.z
+          # 基本校验：必须是 x.y.z
           if ! echo "${N8N_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "解析后的版本号不符合预期：${N8N_VERSION}（原始：${RAW_TAG}）" >&2
             exit 1
           fi
 
           echo "n8n_version=${N8N_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "解析后的 n8n 版本号：${N8N_VERSION}"
+          echo "解析后的 n8n_version：${N8N_VERSION}"
 
       # 2) 登录 GHCR
       - uses: docker/login-action@v3
@@ -67,15 +65,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3) 如果这个版本的 tag 在 GHCR 已经存在，就跳过构建
-      # 这样 schedule 每 6 小时跑也不会重复消耗资源
+      # 3) 如果 GHCR 已经存在该版本 tag，就跳过构建（避免 schedule 重复构建）
       - name: 如果 GHCR 已有该版本则跳过
         id: check
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/n8n:${{ steps.upstream.outputs.n8n_version }}"
-
-          # docker manifest inspect 返回 0 表示存在，非 0 表示不存在
           if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "GHCR 已存在：${IMAGE}，跳过构建"
@@ -84,17 +79,24 @@ jobs:
             echo "GHCR 不存在：${IMAGE}，将执行构建"
           fi
 
+      # 4) 多架构构建需要 QEMU（仅在要构建时启用）
+      - name: 启用 QEMU（跨架构构建）
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
         if: steps.check.outputs.exists != 'true'
 
-      # 4) 构建并推送（只在不存在时执行）
-      - name: 构建并推送 n8n 镜像
+      # 5) 构建并推送（同时发布 amd64 + arm64）
+      - name: 构建并推送 n8n 镜像（多架构）
         if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
-          context: .
+          # 建议把构建上下文收敛到镜像目录（更干净）
+          context: images/n8n
           file: images/n8n/Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             N8N_VERSION=${{ steps.upstream.outputs.n8n_version }}
           tags: |
