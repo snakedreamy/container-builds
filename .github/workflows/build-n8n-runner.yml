@@ -62,18 +62,28 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # 3) 如果 GHCR 已有该 digest 版本则跳过
-      - name: 如果 GHCR 已有该 digest 版本则跳过
+      - name: 如果 GHCR 已有该 digest 版本且包含 arm64 则跳过
         id: check
         run: |
           set -euo pipefail
+
           IMAGE="ghcr.io/${{ github.repository_owner }}/n8n-runner:digest-${{ steps.upstream.outputs.short_digest }}"
 
-          if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "GHCR 已存在：${IMAGE}，跳过构建"
-          else
+          # 先看 tag 是否存在
+          if ! docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "GHCR 不存在：${IMAGE}，将执行构建"
+            exit 0
+          fi
+
+          # 再检查 manifest 里是否包含 arm64
+          # 这里用 jq 判断是否存在 architecture=arm64 的条目
+          if docker manifest inspect "${IMAGE}" | jq -e '.manifests[] | select(.platform.architecture=="arm64")' >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "GHCR 已存在且包含 arm64：${IMAGE}，跳过构建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "GHCR 已存在但缺少 arm64：${IMAGE}，强制重建"
           fi
 
       # 4) 多架构构建需要 QEMU + buildx
