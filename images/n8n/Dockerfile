@@ -2,20 +2,29 @@
 
 ARG N8N_VERSION=latest
 
-# 使用 GHCR 上的官方镜像作为底座 (与 workflow 检查的源保持一致)
+# 1) 字体准备阶段：用标准 alpine 安装字体（这里肯定有 apk）
+FROM alpine:3.22 AS fonts
+RUN set -eux; \
+    apk add --no-cache \
+      ttf-dejavu \
+      font-noto-cjk \
+      fontconfig; \
+    fc-cache -f
+
+# 2) 最终镜像：仍然基于官方 n8n 镜像（哪怕它是 hardened、没有 apk）
 FROM ghcr.io/n8n-io/n8n:${N8N_VERSION}
 
 USER root
 
-# 优化字体支持 (解决 PDF 生成和截图时的中文乱码)
-# ttf-dejavu: 覆盖基础西文符号
-# font-noto-cjk: 谷歌思源字体，完美支持简繁中日韩
-RUN set -eux; \
-    apk add --no-cache \
-    ttf-dejavu \
-    font-noto-cjk
+# 只拷字体文件（最通用、风险最低）
+COPY --from=fonts /usr/share/fonts /usr/share/fonts
 
-# 如果未来需要安装其他系统级工具，写在这里
-# RUN apk add --no-cache ffmpeg
+# 如果底座本身带 fontconfig，则刷新缓存；没有也不报错
+RUN set -eux; \
+    if command -v fc-cache >/dev/null 2>&1; then \
+      fc-cache -f; \
+    else \
+      echo "fc-cache not found in base image; skipped cache refresh"; \
+    fi
 
 USER node
