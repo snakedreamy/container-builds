@@ -3,7 +3,7 @@
 # ---------------------------
 # 由 workflow 传入 runners 版本
 # ---------------------------
-ARG RUNNERS_VERSION
+ARG RUNNERS_VERSION=latest
 FROM n8nio/runners:${RUNNERS_VERSION}
 
 # ---------------------------

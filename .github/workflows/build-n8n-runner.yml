@@ -128,7 +128,7 @@ jobs:
         if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: images/n8n-runner
           file: images/n8n-runner/Dockerfile
           push: true
           build-args: |
