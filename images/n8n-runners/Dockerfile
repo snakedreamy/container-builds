@@ -9,7 +9,7 @@ USER root
 # --- JavaScript Runner 扩展 ---
 # 安装常用库，方便 Function 节点调用
 RUN cd /opt/runners/task-runner-javascript && \
-    pnpm add moment uuid lodash puppeteer-core
+    pnpm add moment uuid lodash chrome-remote-interface
 
 # --- Python Runner 扩展 ---
 # 安装数据处理常用库
