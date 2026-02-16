@@ -27,4 +27,5 @@ RUN set -eux; \
       echo "fc-cache not found in base image; skipped cache refresh"; \
     fi
 
+# 切换回普通用户
 USER node
