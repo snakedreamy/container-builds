@@ -1,0 +1,149 @@
+name: 构建并发布镜像（统一入口）
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "images/**"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/_build-image.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "选择要构建的镜像"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - n8n
+          - n8n-runners
+  schedule:
+    # 注意：GitHub cron 是 UTC
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plan:
+    name: 计划本次要构建的镜像集合
+    runs-on: ubuntu-latest
+    outputs:
+      has_jobs: ${{ steps.gen.outputs.has_jobs }}
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算哪些镜像目录发生了变更（push 场景）
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            n8n:
+              - "images/n8n/**"
+            n8n_runners:
+              - "images/n8n-runners/**"
+
+      - name: 生成 matrix（schedule=全量，push=仅变更，dispatch=按选择）
+        id: gen
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ github.event.inputs.target }}
+          CHANGED_N8N: ${{ steps.filter.outputs.n8n }}
+          CHANGED_RUNNERS: ${{ steps.filter.outputs.n8n_runners }}
+        run: |
+          python - <<'PY'
+          import json, os
+
+          event = os.getenv("EVENT_NAME")
+          target = (os.getenv("TARGET") or "").strip() or "all"
+
+          changed = {
+            "n8n": (os.getenv("CHANGED_N8N", "false") == "true"),
+            "n8n-runners": (os.getenv("CHANGED_RUNNERS", "false") == "true"),
+          }
+
+          # 这里就是你的“镜像注册表”：新增镜像只需要加一段
+          all_items = [
+            {
+              "image_name": "n8n",
+              "context": "images/n8n",
+              "dockerfile": "images/n8n/Dockerfile",
+              "upstream_image": "ghcr.io/n8n-io/n8n",
+              "upstream_repo": "n8n-io/n8n",
+              "version_source": "github_release",
+              "version_sed": "s/^v//; s/^n8n@//",
+              "upstream_tag_template": "{version}",
+              "version_arg_name": "N8N_VERSION",
+              "push_digest_tag": False,
+              "concurrency_group": "build-n8n",
+            },
+            {
+              "image_name": "n8n-runners",
+              "context": "images/n8n-runners",
+              "dockerfile": "images/n8n-runners/Dockerfile",
+              "upstream_image": "ghcr.io/n8n-io/runners",
+              "upstream_repo": "n8n-io/n8n",
+              "version_source": "github_release",
+              "version_sed": "s/^v//; s/^n8n@//",
+              "upstream_tag_template": "{version}",
+              "version_arg_name": "RUNNERS_VERSION",
+              "push_digest_tag": True,
+              "concurrency_group": "build-n8n-runners",
+            },
+          ]
+
+          def should_include(item):
+            name = item["image_name"]
+            if event == "schedule":
+              return True
+            if event == "workflow_dispatch":
+              return (target == "all") or (target == name)
+            # push
+            return changed.get(name, False)
+
+          selected = [i for i in all_items if should_include(i)]
+          matrix = {"include": selected}
+
+          has_jobs = "true" if selected else "false"
+          print("Selected:", [i["image_name"] for i in selected])
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"has_jobs={has_jobs}\n")
+            f.write("matrix=" + json.dumps(matrix) + "\n")
+          PY
+
+  build:
+    name: 构建并推送（matrix）
+    needs: plan
+    if: needs.plan.outputs.has_jobs == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image_name: ${{ matrix.image_name }}
+      context: ${{ matrix.context }}
+      dockerfile: ${{ matrix.dockerfile }}
+
+      upstream_image: ${{ matrix.upstream_image }}
+      upstream_repo: ${{ matrix.upstream_repo }}
+      version_source: ${{ matrix.version_source }}
+      version_sed: ${{ matrix.version_sed }}
+      upstream_tag_template: ${{ matrix.upstream_tag_template }}
+
+      version_arg_name: ${{ matrix.version_arg_name }}
+
+      push_latest: true
+      push_version: true
+      push_build_key: true
+      push_digest_tag: ${{ matrix.push_digest_tag }}
+
+      concurrency_group: ${{ matrix.concurrency_group }}
+
+      enable_provenance: true
+      enable_sbom: true

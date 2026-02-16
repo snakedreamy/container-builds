@@ -1,0 +1,363 @@
+name: 通用构建并发布镜像（Reusable）
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+
+      context:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+
+      upstream_image:
+        required: true
+        type: string
+
+      version_source:
+        required: false
+        type: string
+        default: github_release
+
+      upstream_repo:
+        required: false
+        type: string
+        default: ""
+
+      version_sed:
+        required: false
+        type: string
+        default: "s/^v//; s/^n8n@//"
+
+      upstream_tag_template:
+        required: false
+        type: string
+        default: "{version}"
+
+      upstream_tag:
+        required: false
+        type: string
+        default: ""
+
+      platforms:
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+
+      version_arg_name:
+        required: false
+        type: string
+        default: ""
+
+      extra_build_args:
+        required: false
+        type: string
+        default: ""
+
+      push_latest:
+        required: false
+        type: boolean
+        default: true
+      push_version:
+        required: false
+        type: boolean
+        default: true
+      push_build_key:
+        required: false
+        type: boolean
+        default: true
+      push_digest_tag:
+        required: false
+        type: boolean
+        default: false
+
+      extra_tag_suffixes:
+        required: false
+        type: string
+        default: ""
+
+      concurrency_group:
+        required: false
+        type: string
+        default: ""
+
+      # ✅ 更现代/标准/安全：SBOM & Provenance
+      enable_provenance:
+        required: false
+        type: boolean
+        default: true
+      enable_sbom:
+        required: false
+        type: boolean
+        default: true
+
+    outputs:
+      should_build:
+        value: ${{ jobs.build.outputs.should_build }}
+      version:
+        value: ${{ jobs.build.outputs.version }}
+      upstream_digest:
+        value: ${{ jobs.build.outputs.upstream_digest }}
+      build_key:
+        value: ${{ jobs.build.outputs.build_key }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ inputs.concurrency_group != '' && inputs.concurrency_group || format('build-{0}', inputs.image_name) }}
+      cancel-in-progress: true
+
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      version: ${{ steps.meta.outputs.version }}
+      upstream_digest: ${{ steps.upstream.outputs.upstream_digest }}
+      build_key: ${{ steps.key.outputs.build_key }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本与上游引用（version / upstream_tag / upstream_ref）
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          MODE="${{ inputs.version_source }}"
+
+          if [ "${MODE}" = "github_release" ]; then
+            if [ -z "${{ inputs.upstream_repo }}" ]; then
+              echo "错误：version_source=github_release 时，必须提供 upstream_repo" >&2
+              exit 1
+            fi
+
+            RAW_TAG="$(gh api "repos/${{ inputs.upstream_repo }}/releases/latest" --jq '.tag_name')"
+            VERSION="$(echo "${RAW_TAG}" | sed -E '${{ inputs.version_sed }}')"
+
+            if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+              echo "错误：无法解析上游版本号（tag_name=${RAW_TAG}）" >&2
+              exit 1
+            fi
+
+            if [ -n "${{ inputs.upstream_tag }}" ]; then
+              UP_TAG="${{ inputs.upstream_tag }}"
+            else
+              TEMPLATE="${{ inputs.upstream_tag_template }}"
+              UP_TAG="${TEMPLATE//\{version\}/${VERSION}}"
+            fi
+
+          elif [ "${MODE}" = "tag" ]; then
+            if [ -z "${{ inputs.upstream_tag }}" ]; then
+              echo "错误：version_source=tag 时，必须提供 upstream_tag（如 latest/base）" >&2
+              exit 1
+            fi
+            UP_TAG="${{ inputs.upstream_tag }}"
+            VERSION="${UP_TAG}"
+            RAW_TAG="${UP_TAG}"
+          else
+            echo "错误：未知 version_source=${MODE}（仅支持 github_release / tag）" >&2
+            exit 1
+          fi
+
+          UP_REF="${{ inputs.upstream_image }}:${UP_TAG}"
+
+          echo "raw_tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=${UP_TAG}" >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=${UP_REF}" >> "$GITHUB_OUTPUT"
+
+          echo "✅ version=${VERSION}"
+          echo "✅ upstream_ref=${UP_REF}"
+
+      - name: 获取上游镜像 Digest（若未同步则跳过）
+        id: upstream
+        run: |
+          set -euo pipefail
+          UP_REF="${{ steps.meta.outputs.upstream_ref }}"
+
+          echo "正在检查上游：${UP_REF}"
+
+          if DIGEST="$(docker run --rm quay.io/skopeo/stable:latest inspect "docker://${UP_REF}" --format '{{.Digest}}' 2>/dev/null)"; then
+            SHORT="$(echo "${DIGEST}" | sed 's/^sha256://' | cut -c1-12)"
+            echo "upstream_available=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "short_digest=${SHORT}" >> "$GITHUB_OUTPUT"
+            echo "✅ 上游 Digest: ${DIGEST}"
+          else
+            echo "upstream_available=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 上游镜像尚不可用或未同步（${UP_REF}），跳过本次构建"
+          fi
+
+      - name: 登录 GHCR（用于检查/推送本仓库镜像）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: 计算本地构建上下文 Hash（context）
+        if: steps.upstream.outputs.upstream_available == 'true'
+        id: ctx
+        run: |
+          set -euo pipefail
+          CONTEXT="${{ inputs.context }}"
+          CTX="$( (find "${CONTEXT}" -type f -print0 | sort -z | xargs -0 sha256sum) \
+                | sha256sum | awk '{print $1}' | cut -c1-12 )"
+          echo "ctx=${CTX}" >> "$GITHUB_OUTPUT"
+          echo "📦 本地上下文短哈希: ${CTX}"
+
+      - name: 生成 Build Key（short_digest + ctx）
+        if: steps.upstream.outputs.upstream_available == 'true'
+        id: key
+        run: |
+          set -euo pipefail
+          UP_SHORT="${{ steps.upstream.outputs.short_digest }}"
+          CTX="${{ steps.ctx.outputs.ctx }}"
+          BUILD_KEY="${UP_SHORT}-${CTX}"
+          echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
+          echo "🔑 Build Key: ${BUILD_KEY}"
+
+      - name: 检查 build-<key> 是否已存在（避免重复构建）
+        if: steps.upstream.outputs.upstream_available == 'true'
+        id: check
+        run: |
+          set -euo pipefail
+          TARGET="ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}"
+          IMG="${TARGET}:build-${{ steps.key.outputs.build_key }}"
+
+          echo "正在检查镜像: ${IMG}"
+
+          if docker manifest inspect "${IMG}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "🎉 已存在（同 upstream + 同本地上下文），跳过构建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "🚀 不存在，准备构建"
+          fi
+
+      - name: 决策：是否需要构建
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.upstream.outputs.upstream_available }}" != "true" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 渲染 tags（多行）与 labels（多行）
+        if: steps.decide.outputs.should_build == 'true'
+        id: render
+        run: |
+          set -euo pipefail
+
+          TARGET="ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          BUILD_KEY="${{ steps.key.outputs.build_key }}"
+          SHORT="${{ steps.upstream.outputs.short_digest }}"
+
+          TAGS=""
+
+          if [ "${{ inputs.push_latest }}" = "true" ]; then
+            TAGS="${TAGS}${TARGET}:latest"$'\n'
+          fi
+          if [ "${{ inputs.push_version }}" = "true" ]; then
+            TAGS="${TAGS}${TARGET}:${VERSION}"$'\n'
+          fi
+          if [ "${{ inputs.push_build_key }}" = "true" ]; then
+            TAGS="${TAGS}${TARGET}:build-${BUILD_KEY}"$'\n'
+          fi
+          if [ "${{ inputs.push_digest_tag }}" = "true" ]; then
+            TAGS="${TAGS}${TARGET}:digest-${SHORT}"$'\n'
+          fi
+
+          EXTRA="${{ inputs.extra_tag_suffixes }}"
+          if [ -n "${EXTRA}" ]; then
+            while IFS= read -r line; do
+              line="$(echo "${line}" | xargs || true)"
+              [ -z "${line}" ] && continue
+              TAGS="${TAGS}${TARGET}:${line}"$'\n'
+            done <<< "${EXTRA}"
+          fi
+
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s' "${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "labels<<EOF" >> "$GITHUB_OUTPUT"
+          cat <<EOF >> "$GITHUB_OUTPUT"
+          org.opencontainers.image.source=${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          io.mu8u.upstream.ref=${{ steps.meta.outputs.upstream_ref }}
+          io.mu8u.upstream.digest=${{ steps.upstream.outputs.upstream_digest }}
+          io.mu8u.build.key=${{ steps.key.outputs.build_key }}
+          EOF
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: 渲染 build-args（多行）
+        if: steps.decide.outputs.should_build == 'true'
+        id: args
+        run: |
+          set -euo pipefail
+
+          OUT=""
+
+          if [ -n "${{ inputs.version_arg_name }}" ]; then
+            OUT="${OUT}${{ inputs.version_arg_name }}=${{ steps.meta.outputs.version }}"$'\n'
+          fi
+
+          EXTRA="${{ inputs.extra_build_args }}"
+          if [ -n "${EXTRA}" ]; then
+            OUT="${OUT}${EXTRA}"$'\n'
+          fi
+
+          echo "build_args<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s' "${OUT}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.decide.outputs.should_build == 'true'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.decide.outputs.should_build == 'true'
+
+      - name: 构建并推送镜像
+        if: steps.decide.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ steps.args.outputs.build_args }}
+          tags: ${{ steps.render.outputs.tags }}
+          labels: ${{ steps.render.outputs.labels }}
+          provenance: ${{ inputs.enable_provenance }}
+          sbom: ${{ inputs.enable_sbom }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 结束（跳过原因提示）
+        if: steps.decide.outputs.should_build != 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.upstream.outputs.upstream_available }}" != "true" ]; then
+            echo "未构建：上游镜像尚未同步或不可用（${{ steps.meta.outputs.upstream_ref }}）"
+          else
+            echo "未构建：build-${{ steps.key.outputs.build_key }} 已存在（同 upstream + 同本地上下文）"
+          fi
