@@ -44,6 +44,11 @@ ENV LC_ALL en_US.UTF-8
 # 5. 配置 SSH 密钥目录
 # 为 Root 准备 .ssh 目录
 RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+# 【核心修复】将 root 加入 nogroup (GID 65534)
+# 这样 SSH 登录时，PAM 读取 /etc/group 就会保留这个组权限
+RUN usermod -aG nogroup root
+# 也可以顺手把 video/render 加进去，虽然在 rootless 映射下 nogroup 才是起作用的那个
+RUN usermod -aG video,render root
 
 # 6. 启动脚本
 EXPOSE 22
