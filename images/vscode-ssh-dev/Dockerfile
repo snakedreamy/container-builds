@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     && rm -rf /var/lib/apt/lists/*
 
-# 将 abc 用户家目录指派给 /config（你原本的关键思路）
+# 将 abc 用户家目录指派给 /config
 RUN usermod -d /config abc && \
     usermod -s /bin/bash abc
 
