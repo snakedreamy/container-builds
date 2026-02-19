@@ -57,12 +57,16 @@ jobs:
           filters: |
             n8n:
               - "images/n8n/**"
+              - "!images/n8n/README.md"
             n8n-runners:
               - "images/n8n-runners/**"
+              - "!images/n8n-runners/README.md"
             vscode-ssh-dev:
               - "images/vscode-ssh-dev/**"
+              - "!images/vscode-ssh-dev/README.md"
             webtop:
               - "images/webtop/**"
+              - "!images/webtop/README.md"
 
       # 生成 matrix：
       # - schedule：按 cron 分流（fast/weekly）
