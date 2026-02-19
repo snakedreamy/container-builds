@@ -1,63 +1,90 @@
 name: 通用构建并发布镜像（Reusable）
 
+# 这是一个「可复用工作流」：由其它 workflow 通过 uses: ./.github/workflows/_build-image.yml 调用。
+# 设计目标：
+# 1) 支持两种“版本来源”：
+#    - github_release：从上游仓库 latest release 解析 tag 作为版本（例如 n8n）
+#    - tag：直接使用传入的 upstream_tag 作为版本（例如 LSIO baseimage / webtop 的变体 tag）
+# 2) 通过「上游镜像 digest + 本地 context hash」生成 build_key：
+#    - 如果 build-<key> tag 已存在，则跳过构建，避免重复消耗 CI
+# 3) 统一推送到 GHCR，并打上 latest/version/build-key（可选 digest）等 tag
+
 on:
   workflow_call:
     inputs:
+      # ---- 必填：本仓库镜像基本信息 ----
       image_name:
         required: true
         type: string
 
+      # docker build 的上下文目录（通常是 images/<name>）
       context:
         required: true
         type: string
+
+      # Dockerfile 路径（通常是 images/<name>/Dockerfile）
       dockerfile:
         required: true
         type: string
 
+      # ---- 必填：上游镜像（用于“是否需要重建”的判定）----
       upstream_image:
         required: true
         type: string
 
+      # ---- 版本来源模式 ----
+      # github_release：通过 GitHub API 拉取 releases/latest 的 tag_name，然后用 sed 解析版本
+      # tag：直接使用 upstream_tag 作为“版本”
       version_source:
         required: false
         type: string
         default: github_release
 
+      # github_release 模式下需要：上游仓库（owner/repo）
       upstream_repo:
         required: false
         type: string
         default: ""
 
+      # 将上游 tag_name 转成版本号的 sed（比如 n8n tag 形如 v1.2.3 或 n8n@1.2.3）
       version_sed:
         required: false
         type: string
         default: "s/^v//; s/^n8n@//"
 
+      # 若不直接指定 upstream_tag，则用模板从 {version} 生成 upstream tag
       upstream_tag_template:
         required: false
         type: string
         default: "{version}"
 
+      # 可手动指定上游 tag（优先级高于 upstream_tag_template）
+      # - github_release 模式：可用于覆盖自动推导出来的 tag
+      # - tag 模式：必须提供
       upstream_tag:
         required: false
         type: string
         default: ""
 
+      # 构建的平台（多架构）
       platforms:
         required: false
         type: string
         default: "linux/amd64,linux/arm64"
 
+      # 若你的 Dockerfile 支持通过 build-arg 注入版本号，则填这里的 ARG 名
       version_arg_name:
         required: false
         type: string
         default: ""
 
+      # 额外 build args（多行/多参数，原样透传给 build-push-action）
       extra_build_args:
         required: false
         type: string
         default: ""
 
+      # ---- 推送策略：是否推送某些 tag ----
       push_latest:
         required: false
         type: boolean
@@ -75,16 +102,22 @@ on:
         type: boolean
         default: false
 
+      # 额外 tag 后缀列表（每行一个），例如：
+      # extra_tag_suffixes: |
+      #   dev
+      #   nightly
       extra_tag_suffixes:
         required: false
         type: string
         default: ""
 
+      # 并发组：用于同一镜像的并发构建互斥（避免同时 push 冲突）
       concurrency_group:
         required: false
         type: string
         default: ""
 
+      # buildx provenance / sbom 开关（供 supply-chain 追踪）
       enable_provenance:
         required: false
         type: boolean
@@ -95,12 +128,16 @@ on:
         default: true
 
     outputs:
+      # should_build：最终是否真的执行 build&push（上游不可用/已存在 build-key 时为 false）
       should_build:
         value: ${{ jobs.build.outputs.should_build }}
+      # version：解析出的版本号（github_release 解析 / tag 直接取 upstream_tag）
       version:
         value: ${{ jobs.build.outputs.version }}
+      # upstream_digest：上游镜像 digest（用于 build-key 和标签/label）
       upstream_digest:
         value: ${{ jobs.build.outputs.upstream_digest }}
+      # build_key：short_digest + ctx_hash，用于避免重复构建
       build_key:
         value: ${{ jobs.build.outputs.build_key }}
 
@@ -111,6 +148,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    # 并发控制：
+    # - 若调用方传了 concurrency_group 则使用之
+    # - 否则默认按 image_name 构造 build-<image_name>
     concurrency:
       group: ${{ inputs.concurrency_group != '' && inputs.concurrency_group || format('build-{0}', inputs.image_name) }}
       cancel-in-progress: true
@@ -124,6 +165,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 解析版本与上游引用：
+      # - github_release：从 upstream_repo 的 releases/latest 获取 tag_name，再 sed 解析成 version
+      # - tag：直接使用 upstream_tag
+      # 产出：
+      # - version：用于推送 tag（例如 :1.2.3）
+      # - upstream_ref：用于 skopeo inspect（例如 lscr.io/...:noble）
       - name: 解析版本与上游引用（version / upstream_tag / upstream_ref）
         id: meta
         env:
@@ -177,6 +224,9 @@ jobs:
           echo "✅ version=${VERSION}"
           echo "✅ upstream_ref=${UP_REF}"
 
+      # 获取上游镜像 digest：
+      # - 用 skopeo inspect 去查 docker://<upstream_ref> 的 digest
+      # - 若上游镜像 tag 尚未同步/不可用，则 upstream_available=false，后续直接跳过构建
       - name: 获取上游镜像 Digest（若未同步则跳过）
         id: upstream
         run: |
@@ -196,6 +246,9 @@ jobs:
             echo "⚠️ 上游镜像尚不可用或未同步（${UP_REF}），跳过本次构建"
           fi
 
+      # 登录 GHCR：
+      # - 既用于检查目标 tag 是否存在（docker manifest inspect）
+      # - 也用于最后 build-push-action 推送镜像
       - name: 登录 GHCR（用于检查/推送本仓库镜像）
         uses: docker/login-action@v3
         with:
@@ -203,6 +256,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # 计算 context 的内容 hash（截断 12 位）：
+      # - 把 context 目录内所有文件 sha256 汇总，再 sha256 一次得到整体 hash
+      # - 用于 build_key，确保“同一上游 digest + 同一上下文”不重复构建
       - name: 计算本地构建上下文 Hash（context）
         if: steps.upstream.outputs.upstream_available == 'true'
         id: ctx
@@ -213,6 +269,8 @@ jobs:
                 | sha256sum | awk '{print $1}' | cut -c1-12 )"
           echo "ctx=${CTX}" >> "$GITHUB_OUTPUT"
 
+      # build_key = <上游digest短码> + "-" + <context短hash>
+      # - 只要其中任意一项变化，就会生成新 build_key，触发新构建
       - name: 生成 Build Key（short_digest + ctx）
         if: steps.upstream.outputs.upstream_available == 'true'
         id: key
@@ -223,6 +281,9 @@ jobs:
           BUILD_KEY="${UP_SHORT}-${CTX}"
           echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
 
+      # 通过 docker manifest inspect 检查：
+      # - ghcr.io/<owner>/<image_name>:build-<build_key> 是否已经存在
+      # - 存在则说明之前已经构建过同一组合，无需重复构建
       - name: 检查 build-<key> 是否已存在（避免重复构建）
         if: steps.upstream.outputs.upstream_available == 'true'
         id: check
@@ -236,6 +297,10 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # 最终决策：
+      # - 上游不可用：should_build=false
+      # - build-<key> 已存在：should_build=false
+      # - 否则：should_build=true
       - name: 决策：是否需要构建
         id: decide
         run: |
@@ -250,6 +315,9 @@ jobs:
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # 渲染 tags / labels：
+      # - tags 采用多行输出，供 docker/build-push-action 直接使用
+      # - labels 用于追踪来源/版本/上游引用/digest/build_key
       - name: 渲染 tags（多行）与 labels（多行）
         if: steps.decide.outputs.should_build == 'true'
         id: render
@@ -300,6 +368,9 @@ jobs:
           EOF
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      # 渲染 build-args：
+      # - 若提供 version_arg_name，则注入 <ARG_NAME>=<version>
+      # - extra_build_args 支持多行追加
       - name: 渲染 build-args（多行）
         if: steps.decide.outputs.should_build == 'true'
         id: args
@@ -317,12 +388,17 @@ jobs:
           printf '%s' "${OUT}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      # 多架构构建准备：QEMU + buildx
       - uses: docker/setup-qemu-action@v3
         if: steps.decide.outputs.should_build == 'true'
 
       - uses: docker/setup-buildx-action@v3
         if: steps.decide.outputs.should_build == 'true'
 
+      # 最终 build & push：
+      # - push=true 推到 GHCR
+      # - tags/labels/build-args 来自上面渲染输出（多行）
+      # - cache-from/cache-to 使用 GHA cache 加速
       - name: 构建并推送镜像
         if: steps.decide.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
