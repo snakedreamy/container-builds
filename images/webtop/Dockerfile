@@ -39,6 +39,6 @@ ENV NPM_CONFIG_PREFIX=/config/.npm-global \
 ENV PATH="/config/.npm-global/bin:${PATH}"
 
 # （可选）你要额外装的 apt 软件就放在这里
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#     git vim nano \
-#     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git nano htop\
+    && rm -rf /var/lib/apt/lists/*

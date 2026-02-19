@@ -65,7 +65,7 @@ jobs:
             vscode-ssh-dev:
               - "images/vscode-ssh-dev/**"
             webtop:
-              - "images/webtop/**" # ✅ 新增：webtop 目录变更检测
+              - "images/webtop/**"
 
       # 生成 matrix：
       # - schedule：按 cron 分流（fast/weekly）
