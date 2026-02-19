@@ -54,6 +54,7 @@ jobs:
         uses: dorny/paths-filter@v3
         if: github.event_name == 'push'
         with:
+          predicate-quantifier: 'every'
           filters: |
             n8n:
               - "images/n8n/**"
