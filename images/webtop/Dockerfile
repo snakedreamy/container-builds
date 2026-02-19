@@ -31,6 +31,13 @@ RUN set -eux; \
     rm -f "/tmp/${file}" /tmp/SHASUMS256.txt; \
     node --version; npm --version
 
+# npm 全局工具持久化到 /config（volume）
+ENV NPM_CONFIG_PREFIX=/config/.npm-global \
+    NPM_CONFIG_CACHE=/config/.npm
+
+# 让全局 bin 在任何执行环境下可用（不依赖 .bashrc）
+ENV PATH="/config/.npm-global/bin:${PATH}"
+
 # （可选）你要额外装的 apt 软件就放在这里
 # RUN apt-get update && apt-get install -y --no-install-recommends \
 #     git vim nano \
