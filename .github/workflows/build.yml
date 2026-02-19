@@ -53,6 +53,10 @@ jobs:
         id: filter
         uses: dorny/paths-filter@v3
         with:
+        # 某些事件（如 workflow_dispatch）payload 不包含 before 字段，
+        # paths-filter 会退化并产生 warning；显式指定 base 可避免该 warning。
+        # base=HEAD 表示以当前检出的 HEAD 作为基线进行变更检测（不改变你现有筛选逻辑，只让它更稳定）。
+        base: HEAD
           filters: |
             n8n:
               - "images/n8n/**"
