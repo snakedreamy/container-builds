@@ -2,14 +2,16 @@ FROM lscr.io/linuxserver/webtop:ubuntu-xfce
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1) 只加你需要的 apt 软件（尽量少动）
+# 先装解压/下载所需的基础工具（xz-utils 是 tar.xz 的关键）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl wget vim nano \
-    # 你需要的其它包...
+    ca-certificates \
+    curl \
+    tar \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# 2) 可选：安装 Node 24 LTS（构建时追 latest-v24.x）
-#    （这不会改变 webtop 的 init/服务，只是多了 node/npm）
+# Install Node.js 24.x (LTS) from official "latest-v24.x" directory at build time.
+# This will NOT trigger rebuilds by itself; it only updates when you rebuild for other reasons.
 ARG NODE_DIST=latest-v24.x
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
@@ -28,3 +30,8 @@ RUN set -eux; \
     tar -xJf "${file}" -C /usr/local --strip-components=1; \
     rm -f "/tmp/${file}" /tmp/SHASUMS256.txt; \
     node --version; npm --version
+
+# （可选）你要额外装的 apt 软件就放在这里
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     git vim nano \
+#     && rm -rf /var/lib/apt/lists/*
