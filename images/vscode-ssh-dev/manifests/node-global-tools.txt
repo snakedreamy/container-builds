@@ -2,4 +2,4 @@
 # Pin version with: name@x.y.z
 # For scoped packages, pin with: @scope/name@x.y.z
 
-@openai/codex
+npm-check-updates
