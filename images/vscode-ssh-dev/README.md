@@ -69,6 +69,155 @@ images/vscode-ssh-dev/
 
 ---
 
+我们就按 **FastAPI 新项目**来走一遍（从 0 到能跑起来），全部用 `uv`，并且用“项目级 `.venv`”。
+
+
+#### 创建项目目录并初始化
+
+```bash
+mkdir -p ~/projects/fastapi-demo
+cd ~/projects/fastapi-demo
+
+uv init
+```
+
+执行完会生成 `pyproject.toml`（uv 识别项目的关键）。
+
+---
+
+#### 添加依赖（FastAPI + Uvicorn）
+
+```bash
+uv add fastapi "uvicorn[standard]"
+```
+
+这一步会：
+
+* 写入 `pyproject.toml` 的 dependencies
+* 生成/更新 `uv.lock`（锁定具体版本）
+
+---
+
+#### 写最小 FastAPI 应用
+
+创建 `app/main.py`：
+
+```bash
+mkdir -p app
+cat > app/main.py <<'PY'
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"hello": "world"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+PY
+```
+
+---
+
+#### 同步环境（创建 `.venv` 并安装依赖）
+
+```bash
+uv sync
+```
+
+现在项目里会出现 `.venv/`。
+
+---
+
+#### 运行服务（推荐用 uv run）
+
+```bash
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+然后在另一个终端里验证：
+
+```bash
+curl -s http://127.0.0.1:8000/ | python -m json.tool
+curl -s http://127.0.0.1:8000/health | python -m json.tool
+```
+
+---
+
+####（可选但强烈建议）加开发依赖：ruff + pytest
+
+ruff 可以同时当 linter+formatter（非常省事）：
+
+```bash
+uv add --dev ruff pytest httpx
+```
+
+* `pytest`：测试框架
+* `httpx`：测试 FastAPI 常用（TestClient/请求）
+
+跑格式化/检查：
+
+```bash
+uv run ruff format .
+uv run ruff check .
+```
+
+---
+
+#### 写一个最小测试（可选）
+
+```bash
+cat > test_app.py <<'PY'
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+def test_root():
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json() == {"hello": "world"}
+PY
+```
+
+运行测试：
+
+```bash
+uv run pytest -q
+```
+
+---
+
+#### 升级/换底座后怎么处理？
+
+如果未来 Python 小版本变了、或你重建容器导致 `.venv` 不可用：
+
+```bash
+rm -rf .venv
+uv sync
+```
+
+因为依赖被 `uv.lock` 锁住了，重建会装出同一套环境。
+
+---
+
+#### 你会得到的项目结构（最终）
+
+```text
+fastapi-demo/
+├─ app/
+│  └─ main.py
+├─ pyproject.toml
+├─ uv.lock
+├─ .venv/
+└─ test_app.py   (可选)
+```
+
+
+---
+
 ### 3) Node.js：官方 Node 24 LTS（构建时追 latest-v24.x）
 
 镜像在构建时从 Node 官方的 `latest-v24.x` 目录获取当前最新 Node 24.x tarball，并校验 `SHASUMS256.txt` 后安装。
