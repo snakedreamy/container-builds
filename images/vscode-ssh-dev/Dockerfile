@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     nano \
     htop \
+    iproute2 \
     sqlite3 \
     libsqlite3-dev \
     build-essential \
