@@ -61,10 +61,6 @@ ENV NPM_CONFIG_PREFIX=/config/.npm-global \
     UV_CACHE_DIR=/config/.cache/uv \
     PIP_CACHE_DIR=/config/.cache/pip
 
-# npm 全局工具持久化到 /config（volume）
-ENV NPM_CONFIG_PREFIX=/config/.npm-global \
-    NPM_CONFIG_CACHE=/config/.npm
-
 # 让全局 bin 在任何执行环境下可用（不依赖 .bashrc）
 ENV PATH="/config/.npm-global/bin:${PATH}"
 
